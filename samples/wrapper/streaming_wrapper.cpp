@@ -1,11 +1,11 @@
-// Axiom Custom Wrapper for BOINC
+// Streaming Wrapper for BOINC
 // Based on BOINC wrapper.cpp
 // Modified for streaming applications that need graceful suspend/resume
 //
 // Changes from standard wrapper:
 // - Soft suspend: signals app via file, waits for graceful shutdown, then kills
-// - Resume: clears cache and restarts worker fresh
-// - Designed for websocket-based streaming applications
+// - Resume: restarts worker fresh
+// - Designed for websocket-based streaming applications that can't be paused
 //
 // This file is part of BOINC.
 // http://boinc.berkeley.edu
@@ -26,7 +26,6 @@
 #ifdef _WIN32
 #include "boinc_win.h"
 #include "win_util.h"
-#include <tlhelp32.h>
 #else
 #ifdef HAVE_SYS_WAIT_H
 #include <sys/wait.h>
@@ -58,8 +57,8 @@ using std::vector;
 using std::string;
 
 #define JOB_FILENAME "job.xml"
-#define CHECKPOINT_FILENAME "axiom_wrapper_checkpoint.txt"
-#define SUSPEND_SIGNAL_FILE "axiom_suspend_signal"
+#define CHECKPOINT_FILENAME "streaming_wrapper_checkpoint.txt"
+#define SUSPEND_SIGNAL_FILE "suspend_signal"
 #define POLL_PERIOD 1.0
 #define SUSPEND_WAIT_TIME 2.0  // seconds to wait for graceful shutdown
 
@@ -67,9 +66,6 @@ int nthreads = 1;
 int gpu_device_num = -1;
 double runtime = 0;
 APP_INIT_DATA aid;
-
-// Axiom-specific: cache directory to clear on suspend/resume
-string axiom_cache_dir;
 
 struct TASK {
     string application;
@@ -93,7 +89,7 @@ struct TASK {
     double final_cpu_time;
     double starting_cpu;
     bool suspended;
-    bool killed_for_suspend;  // Axiom: track if we killed for suspend vs real exit
+    bool killed_for_suspend;  // track if we killed for suspend vs real exit
     double elapsed_time;
 #ifdef _WIN32
     HANDLE pid_handle;
@@ -110,7 +106,7 @@ struct TASK {
     bool poll(int& status);
     int run(const vector<string> &child_args);
     void kill();
-    void soft_stop();  // Axiom: graceful stop
+    void soft_stop();  // graceful stop for streaming apps
     void stop();
     void resume();
     double cpu_time();
@@ -166,115 +162,7 @@ struct TASK {
 vector<TASK> tasks;
 vector<TASK> daemons;
 
-// Axiom: Clear cache directory
-void clear_axiom_cache() {
-    char buf[256];
-    fprintf(stderr, "%s Axiom: Clearing cache...\n", boinc_msg_prefix(buf, sizeof(buf)));
-
-#ifdef _WIN32
-    // Clear cache from LOCALAPPDATA
-    char localappdata[MAX_PATH];
-    if (GetEnvironmentVariableA("LOCALAPPDATA", localappdata, MAX_PATH)) {
-        char cache_path[MAX_PATH];
-        snprintf(cache_path, sizeof(cache_path), "%s\\AxiomBOINC\\cache", localappdata);
-
-        char cmd[MAX_PATH + 100];
-        snprintf(cmd, sizeof(cmd), "cmd /c \"if exist \"%s\" rd /s /q \"%s\"\" 2>nul", cache_path, cache_path);
-        system(cmd);
-    }
-
-    // Also try USERPROFILE\Axiom\.cache
-    char userprofile[MAX_PATH];
-    if (GetEnvironmentVariableA("USERPROFILE", userprofile, MAX_PATH)) {
-        char cache_path[MAX_PATH];
-        snprintf(cache_path, sizeof(cache_path), "%s\\Axiom\\.cache", userprofile);
-
-        char cmd[MAX_PATH + 100];
-        snprintf(cmd, sizeof(cmd), "cmd /c \"if exist \"%s\" rd /s /q \"%s\"\" 2>nul", cache_path, cache_path);
-        system(cmd);
-    }
-#else
-    char* home = getenv("HOME");
-    if (home) {
-        char cmd[PATH_MAX + 50];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s/Axiom/.cache 2>/dev/null", home);
-        system(cmd);
-    }
-#endif
-
-    fprintf(stderr, "%s Axiom: Cache cleared\n", boinc_msg_prefix(buf, sizeof(buf)));
-}
-
-// Axiom: Kill all processes matching a pattern
-#ifdef _WIN32
-void kill_axiom_workers() {
-    char buf[256];
-    fprintf(stderr, "%s Axiom: Killing worker processes...\n", boinc_msg_prefix(buf, sizeof(buf)));
-
-    // Multiple passes to catch any stragglers
-    for (int pass = 0; pass < 3; pass++) {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "%s Axiom: CreateToolhelp32Snapshot failed (error %lu)\n",
-                    boinc_msg_prefix(buf, sizeof(buf)), GetLastError());
-            Sleep(100);
-            continue;
-        }
-
-        PROCESSENTRY32 pe;
-        pe.dwSize = sizeof(pe);
-        int killed = 0;
-
-        if (Process32First(hSnapshot, &pe)) {
-            do {
-                if (strstr(pe.szExeFile, "axiom_worker")) {
-                    fprintf(stderr, "%s Axiom: Found process %s (PID %lu)\n",
-                            boinc_msg_prefix(buf, sizeof(buf)), pe.szExeFile, pe.th32ProcessID);
-
-                    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe.th32ProcessID);
-                    if (!hProcess) {
-                        hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
-                    }
-
-                    if (hProcess) {
-                        if (TerminateProcess(hProcess, 1)) {
-                            WaitForSingleObject(hProcess, 1000);
-                            fprintf(stderr, "%s Axiom: Killed PID %lu\n",
-                                    boinc_msg_prefix(buf, sizeof(buf)), pe.th32ProcessID);
-                            killed++;
-                        } else {
-                            fprintf(stderr, "%s Axiom: TerminateProcess failed for PID %lu (error %lu)\n",
-                                    boinc_msg_prefix(buf, sizeof(buf)), pe.th32ProcessID, GetLastError());
-                        }
-                        CloseHandle(hProcess);
-                    } else {
-                        fprintf(stderr, "%s Axiom: OpenProcess failed for PID %lu (error %lu)\n",
-                                boinc_msg_prefix(buf, sizeof(buf)), pe.th32ProcessID, GetLastError());
-                    }
-                }
-            } while (Process32Next(hSnapshot, &pe));
-        }
-        CloseHandle(hSnapshot);
-
-        fprintf(stderr, "%s Axiom: Pass %d killed %d processes\n",
-                boinc_msg_prefix(buf, sizeof(buf)), pass + 1, killed);
-
-        if (killed == 0 && pass > 0) break;
-        Sleep(200);
-    }
-
-    Sleep(300);  // Final wait for processes to fully terminate
-    // MEI folder cleanup is handled by the Python worker with smart tracking
-}
-#else
-void kill_axiom_workers() {
-    system("pkill -9 -f axiom_worker 2>/dev/null");
-    // MEI folder cleanup is handled by the Python worker with smart tracking
-    usleep(500000);
-}
-#endif
-
-// Axiom: Write suspend signal file
+// Write suspend signal file to notify app of pending suspend
 void write_suspend_signal() {
     FILE* f = fopen(SUSPEND_SIGNAL_FILE, "w");
     if (f) {
@@ -283,14 +171,13 @@ void write_suspend_signal() {
     }
 }
 
-// Axiom: Remove suspend signal file
+// Remove suspend signal file
 void remove_suspend_signal() {
     boinc_delete_file(SUSPEND_SIGNAL_FILE);
 }
 
-// Axiom: Check if worker acknowledged suspend
+// Check if worker acknowledged suspend (by deleting the signal file)
 bool check_suspend_acknowledged() {
-    // Worker should delete the signal file when it's ready
     return !boinc_file_exists(SUSPEND_SIGNAL_FILE);
 }
 
@@ -446,7 +333,7 @@ int TASK::run(const vector<string> &child_args) {
         }
     }
 
-    fprintf(stderr, "%s Axiom wrapper: running %s (%s)\n",
+    fprintf(stderr, "%s Streaming wrapper: running %s (%s)\n",
         boinc_msg_prefix(buf, sizeof(buf)), app_path, command_line.c_str());
 
     int priority_val = 0;
@@ -562,7 +449,7 @@ int TASK::run(const vector<string> &child_args) {
     }
 #endif
 
-    fprintf(stderr, "%s Axiom wrapper: created child process %d\n",
+    fprintf(stderr, "%s Streaming wrapper: created child process %d\n",
         boinc_msg_prefix(buf, sizeof(buf)), (int)pid);
 
     suspended = false;
@@ -585,7 +472,7 @@ bool TASK::poll(int& status) {
     unsigned long exit_code;
     if (GetExitCodeProcess(pid_handle, &exit_code)) {
         if (exit_code != STILL_ACTIVE) {
-            // Axiom: If we killed it for suspend, don't treat as real exit
+            // If we killed it for suspend, don't treat as real exit
             if (killed_for_suspend) {
                 return false;
             }
@@ -622,7 +509,7 @@ bool TASK::poll(int& status) {
 
 void TASK::kill() {
     char buf[256];
-    fprintf(stderr, "%s Axiom wrapper: killing task\n", boinc_msg_prefix(buf, sizeof(buf)));
+    fprintf(stderr, "%s Streaming wrapper: killing task\n", boinc_msg_prefix(buf, sizeof(buf)));
 #ifdef _WIN32
     kill_descendants();
 #else
@@ -630,10 +517,11 @@ void TASK::kill() {
 #endif
 }
 
-// Axiom: Soft stop - signal the app to shut down gracefully, then kill
+// Soft stop - signal the app to shut down gracefully, then kill
+// This allows streaming apps to close websocket connections cleanly
 void TASK::soft_stop() {
     char buf[256];
-    fprintf(stderr, "%s Axiom wrapper: soft stopping task (signaling graceful shutdown)\n",
+    fprintf(stderr, "%s Streaming wrapper: soft stopping task (signaling graceful shutdown)\n",
         boinc_msg_prefix(buf, sizeof(buf)));
 
     // Write suspend signal file
@@ -643,39 +531,34 @@ void TASK::soft_stop() {
     double start = dtime();
     while (dtime() - start < SUSPEND_WAIT_TIME) {
         if (check_suspend_acknowledged()) {
-            fprintf(stderr, "%s Axiom wrapper: app acknowledged suspend\n",
+            fprintf(stderr, "%s Streaming wrapper: app acknowledged suspend\n",
                 boinc_msg_prefix(buf, sizeof(buf)));
             break;
         }
         boinc_sleep(0.1);
     }
 
-    // Kill all axiom workers
-    kill_axiom_workers();
-
-    // Note: cache clearing removed - Python worker handles cleanup via mei_tracking.json
-    // and we need to preserve worker_debug.log for diagnostics
+    // Kill the child process tree
+    kill();
 
     // Mark that we killed for suspend (not a real exit)
     killed_for_suspend = true;
     suspended = true;
 
-    fprintf(stderr, "%s Axiom wrapper: soft stop complete\n", boinc_msg_prefix(buf, sizeof(buf)));
+    fprintf(stderr, "%s Streaming wrapper: soft stop complete\n", boinc_msg_prefix(buf, sizeof(buf)));
 }
 
 void TASK::stop() {
-    // Axiom: Use soft stop instead of hard suspend
+    // Use soft stop instead of hard suspend for streaming apps
     soft_stop();
 }
 
 void TASK::resume() {
     char buf[256];
-    fprintf(stderr, "%s Axiom wrapper: resuming task\n", boinc_msg_prefix(buf, sizeof(buf)));
+    fprintf(stderr, "%s Streaming wrapper: resuming task\n", boinc_msg_prefix(buf, sizeof(buf)));
 
     // Remove suspend signal
     remove_suspend_signal();
-
-    // Note: cache clearing removed - preserving debug log and tracking files
 
     // Restart the worker
     killed_for_suspend = false;
@@ -684,7 +567,7 @@ void TASK::resume() {
     vector<string> empty_args;
     int retval = run(empty_args);
     if (retval) {
-        fprintf(stderr, "%s Axiom wrapper: failed to restart task: %d\n",
+        fprintf(stderr, "%s Streaming wrapper: failed to restart task: %d\n",
             boinc_msg_prefix(buf, sizeof(buf)), retval);
     }
 }
@@ -705,18 +588,18 @@ void poll_boinc_messages(TASK& task) {
 
     if (status.no_heartbeat || status.quit_request || status.abort_request) {
         char buf[256];
-        fprintf(stderr, "%s Axiom wrapper: received quit/abort\n", boinc_msg_prefix(buf, sizeof(buf)));
-        kill_axiom_workers();
+        fprintf(stderr, "%s Streaming wrapper: received quit/abort\n", boinc_msg_prefix(buf, sizeof(buf)));
+        task.kill();
         exit(0);
     }
 
-    // AXIOM: All-or-nothing suspend handling
-    // When suspended, kill workers and exit. BOINC will restart fresh when resumed.
-    // Axiom streaming workers can't be paused/resumed - they must be killed.
+    // All-or-nothing suspend handling for streaming apps
+    // When suspended, kill the app and exit. BOINC will restart fresh when resumed.
+    // Streaming apps with websocket connections can't be paused - they must be killed.
     if (status.suspended) {
         char buf[256];
-        fprintf(stderr, "%s Axiom wrapper: suspended - killing workers and exiting\n", boinc_msg_prefix(buf, sizeof(buf)));
-        kill_axiom_workers();
+        fprintf(stderr, "%s Streaming wrapper: suspended - killing app and exiting\n", boinc_msg_prefix(buf, sizeof(buf)));
+        task.kill();
         exit(0);
     }
 }
@@ -751,11 +634,10 @@ int main(int argc, char** argv) {
     char buf[256];
     vector<string> child_args;
 
-    fprintf(stderr, "%s Axiom BOINC wrapper starting\n", boinc_msg_prefix(buf, sizeof(buf)));
+    fprintf(stderr, "%s BOINC streaming wrapper starting\n", boinc_msg_prefix(buf, sizeof(buf)));
 
 #ifdef _WIN32
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-    // MEI folder cleanup is now handled by the Python worker with smart tracking
 #endif
 
     // Parse command line
@@ -812,7 +694,7 @@ int main(int argc, char** argv) {
         retval = task.run(child_args);
 
         if (retval) {
-            fprintf(stderr, "%s Axiom wrapper: task.run() failed: %d\n",
+            fprintf(stderr, "%s Streaming wrapper: task.run() failed: %d\n",
                 boinc_msg_prefix(buf, sizeof(buf)), retval);
             boinc_finish(retval);
         }
@@ -822,7 +704,7 @@ int main(int argc, char** argv) {
             int status;
             if (task.poll(status)) {
                 if (status) {
-                    fprintf(stderr, "%s Axiom wrapper: app exit status: 0x%x\n",
+                    fprintf(stderr, "%s Streaming wrapper: app exit status: 0x%x\n",
                         boinc_msg_prefix(buf, sizeof(buf)), status);
                     boinc_finish(EXIT_CHILD_FAILED);
                 }
@@ -856,9 +738,6 @@ int main(int argc, char** argv) {
         write_checkpoint(i + 1, checkpoint_cpu_time, runtime);
         weight_completed += task.weight;
     }
-
-    // Cleanup - DON'T kill all workers, only our own child (which already exited)
-    // kill_axiom_workers();  // DISABLED - was killing other slots' workers!
 
     boinc_finish(0);
     return 0;

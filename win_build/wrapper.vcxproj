@@ -31,7 +31,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\samples\wrapper\axiom_wrapper.cpp" />
+    <ClCompile Include="..\samples\wrapper\streaming_wrapper.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\samples\wrapper\wrapper_win.h" />
