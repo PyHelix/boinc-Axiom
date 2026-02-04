@@ -31,7 +31,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\samples\wrapper\wrapper.cpp" />
+    <ClCompile Include="..\samples\wrapper\axiom_wrapper.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\samples\wrapper\wrapper_win.h" />
@@ -46,8 +46,8 @@
     <ProjectReference Include="libboinc.vcxproj">
       <Project>{e8f6bd7e-461a-4733-b7d8-37b09a099ed8}</Project>
     </ProjectReference>
-    <ProjectReference Include="libgraphics2.vcxproj">
-      <Project>{814ebfd3-3ce6-4933-a580-c1fe3147acb4}</Project>
+    <ProjectReference Include="libboincapi.vcxproj">
+      <Project>{07BDA8F7-4AAF-4A3B-B96E-EA72A143C5AE}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
