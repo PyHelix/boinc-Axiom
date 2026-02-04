@@ -593,14 +593,13 @@ void poll_boinc_messages(TASK& task) {
         exit(0);
     }
 
-    // All-or-nothing suspend handling for streaming apps
-    // When suspended, kill the app and exit. BOINC will restart fresh when resumed.
-    // Streaming apps with websocket connections can't be paused - they must be killed.
-    if (status.suspended) {
+    // Suspend handling for streaming apps
+    // Kill the worker, wait for resume, then restart
+    if (status.suspended && !task.suspended) {
         char buf[256];
-        fprintf(stderr, "%s Streaming wrapper: suspended - killing app and exiting\n", boinc_msg_prefix(buf, sizeof(buf)));
+        fprintf(stderr, "%s Streaming wrapper: suspended - killing worker and waiting\n", boinc_msg_prefix(buf, sizeof(buf)));
         task.kill();
-        exit(0);
+        task.suspended = true;
     }
 }
 
@@ -703,6 +702,38 @@ int main(int argc, char** argv) {
         while (1) {
             int status;
             if (task.poll(status)) {
+                // Task exited - check if it was due to suspend (we killed it)
+                if (task.suspended) {
+                    // Wait for BOINC to resume us
+                    fprintf(stderr, "%s Streaming wrapper: waiting for resume\n",
+                        boinc_msg_prefix(buf, sizeof(buf)));
+                    while (task.suspended) {
+                        BOINC_STATUS bstatus;
+                        boinc_get_status(&bstatus);
+
+                        if (bstatus.no_heartbeat || bstatus.quit_request || bstatus.abort_request) {
+                            exit(0);
+                        }
+
+                        if (!bstatus.suspended) {
+                            // Resume! Restart the worker
+                            fprintf(stderr, "%s Streaming wrapper: resuming - restarting worker\n",
+                                boinc_msg_prefix(buf, sizeof(buf)));
+                            task.suspended = false;
+                            retval = task.run(child_args);
+                            if (retval) {
+                                fprintf(stderr, "%s Streaming wrapper: task.run() on resume failed: %d\n",
+                                    boinc_msg_prefix(buf, sizeof(buf)), retval);
+                                boinc_finish(retval);
+                            }
+                        }
+
+                        boinc_sleep(POLL_PERIOD);
+                    }
+                    continue;  // back to main poll loop
+                }
+
+                // Normal exit
                 if (status) {
                     fprintf(stderr, "%s Streaming wrapper: app exit status: 0x%x\n",
                         boinc_msg_prefix(buf, sizeof(buf)), status);
